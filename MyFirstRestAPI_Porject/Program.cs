@@ -1,7 +1,8 @@
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.IdentityModel.Tokens;
-using System.Text;
 using Microsoft.OpenApi.Models;
+using System.Text;
 
 // Create the application builder.
 // This object is responsible for configuring services and middleware.
@@ -72,7 +73,6 @@ builder.Services.AddControllers();
 // Swagger Configuration
 // ===============================
 
-
 // Enables Swagger endpoint discovery.
 builder.Services.AddEndpointsApiExplorer();
 
@@ -139,8 +139,13 @@ builder.Services.AddSwaggerGen(options =>
         }
     });
 });
-builder.Services.AddControllers();          
-
+builder.Services.AddControllers();
+builder.Services.AddSingleton<IAuthorizationHandler, StudentOwnerOrAdminHandler>();
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy("StudentOwnerOrAdmin", policy =>
+        policy.Requirements.Add(new StudentOwnerOrAdminRequirement()));
+});
 // Build the application.
 // After this point, services are frozen and middleware is configured.
 var app = builder.Build();
