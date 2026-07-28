@@ -3,6 +3,9 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using System.Text;
+using Microsoft.AspNetCore.RateLimiting;
+using System.Threading.RateLimiting;
+using System.Security.Claims;
 
 // Create the application builder.
 // This object is responsible for configuring services and middleware.
@@ -51,6 +54,8 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             // This must be the same key used when generating the token.
             IssuerSigningKey = new SymmetricSecurityKey(
                 Encoding.UTF8.GetBytes("THIS_IS_A_VERY_SECRET_KEY_123456"))
+,
+            ClockSkew = TimeSpan.Zero
         };
     });
 
@@ -139,6 +144,26 @@ builder.Services.AddSwaggerGen(options =>
         }
     });
 });
+
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+    options.AddPolicy("AuthLimiter", httpContext =>
+    {
+        var ip = httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+
+        return RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: ip,
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 5,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0
+            });
+    });
+});
+
 builder.Services.AddControllers();
 builder.Services.AddSingleton<IAuthorizationHandler, StudentOwnerOrAdminHandler>();
 builder.Services.AddAuthorization(options =>
@@ -166,14 +191,46 @@ if (app.Environment.IsDevelopment())
 
 // Redirect HTTP requests to HTTPS.
 app.UseHttpsRedirection();
+app.UseRateLimiter();
+app.Use(async (context, next) =>
+{
+    await next();
 
-
+    if (context.Response.StatusCode == StatusCodes.Status429TooManyRequests)
+    {
+        await context.Response.WriteAsync("Too many login attempts. Please try again later.");
+    }
+});
 // IMPORTANT:
 // Authentication middleware must run BEFORE authorization middleware.
 // Authentication identifies the user.
 // Authorization decides what the user is allowed to do.
 app.UseAuthentication();
 app.UseAuthorization();
+
+
+// ✅ Step 6: Global 403 logging middleware (place it HERE)
+app.Use(async (context, next) =>
+{
+    await next();
+
+
+    if (context.Response.StatusCode == StatusCodes.Status403Forbidden)
+    {
+        var userId = context.User.FindFirstValue(ClaimTypes.NameIdentifier) ?? "anonymous";
+        var ip = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        var path = context.Request.Path.ToString();
+
+
+        // ✅ Centralized security log for authorization abuse
+        app.Logger.LogWarning(
+            "Forbidden access. UserId={UserId}, Path={Path}, IP={IP}",
+            userId,
+            path,
+            ip
+        );
+    }
+});
 
 
 // Map controller routes (e.g., /api/Students, /api/Auth).

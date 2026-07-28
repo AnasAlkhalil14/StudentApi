@@ -8,7 +8,7 @@ using System.Linq;
 using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
-
+using Microsoft.AspNetCore.RateLimiting;
 using StudentApi.DTOs.Auth;
 
 namespace StudentApi.Controllers
@@ -19,11 +19,25 @@ namespace StudentApi.Controllers
     [Route("api/[controller]")]
     public class AuthController : ControllerBase
     {
+
+        private readonly ILogger<AuthController> _logger;
+
+        public AuthController(ILogger<AuthController> logger)
+        {
+            _logger = logger;
+        }
+
+
+
         // This endpoint handles user login.
         // It verifies credentials and returns a JWT token if login succeeds.
         [HttpPost("login")]
+        [EnableRateLimiting("AuthLimiter")]
+
         public IActionResult Login([FromBody] DTOs.Auth.LoginRequest request)
         {
+            var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+
             // Step 1: Find the student by email from the in-memory data store.
             // Email acts as the unique login identifier.
             var student = StudentDataSimulation.StudentsList
@@ -33,7 +47,15 @@ namespace StudentApi.Controllers
             // If no student is found with the given email,
             // return 401 Unauthorized without revealing which field was wrong.
             if (student == null)
+            {
+                _logger.LogWarning(
+                "Failed login attempt (email not found). Email={Email}, IP={IP}",
+                request.Email,
+                ip
+                );
+
                 return Unauthorized("Invalid credentials");
+            }
 
 
             // Step 2: Verify the provided password against the stored hash.
@@ -42,11 +64,18 @@ namespace StudentApi.Controllers
                 BCrypt.Net.BCrypt.Verify(request.Password, student.PasswordHash);
 
 
-            // If the password does not match the stored hash,
+            // If the password does     not match the stored hash,
             // return 401 Unauthorized.
             if (!isValidPassword)
-                return Unauthorized("Invalid credentials");
+            {
+                _logger.LogWarning(
+                "Failed login attempt (bad password). Email={Email}, IP={IP}",
+                request.Email,
+                ip
+                );
 
+                return Unauthorized("Invalid credentials");
+            }
 
             // Step 3: Create claims that represent the authenticated user's identity.
             // These claims will be embedded inside the JWT.
@@ -82,7 +111,7 @@ namespace StudentApi.Controllers
                 issuer: "StudentApi",
                 audience: "StudentApiUsers",
                 claims: claims,
-                expires: DateTime.Now.AddMinutes(30),
+                expires: DateTime.Now.AddSeconds(1000),
                 signingCredentials: creds
             );
 
@@ -95,7 +124,12 @@ namespace StudentApi.Controllers
             student.RefreshTokenHash = BCrypt.Net.BCrypt.HashPassword(refreshToken);
             student.RefreshTokenExpiresAt = DateTime.UtcNow.AddDays(7);
             student.RefreshTokenRevokedAt = null;
-
+            _logger.LogInformation(
+ "Successful login. UserId={UserId}, Email={Email}, IP={IP}",
+ student.Id,
+ student.Email,
+ ip
+);
             return Ok(new TokenResponse
             {
                 AccessToken = accessToken,
@@ -111,28 +145,90 @@ namespace StudentApi.Controllers
             rng.GetBytes(bytes);
             return Convert.ToBase64String(bytes);
         }
-
-
         [HttpPost("refresh")]
+        [EnableRateLimiting("AuthLimiter")]
         public IActionResult Refresh([FromBody]DTOs.Auth. RefreshRequest request)
         {
+            // ✅ Capture caller IP once (used in all logs for tracing)
+            var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+
+            // ===============================
+            // Step 1: Find student by email
+            // ===============================
             var student = StudentDataSimulation.StudentsList
                 .FirstOrDefault(s => s.Email == request.Email);
 
+            // ===============================
+            // Failure Path #1: Email not found
+            // ===============================
+            // ✅ Safe log: Email + IP only
+            // 📌 Helps detect refresh probing / abuse attempts.
             if (student == null)
+            {
+                _logger.LogWarning(
+                    "Invalid refresh attempt (email not found). Email={Email}, IP={IP}",
+                    request.Email,
+                    ip
+                );
+
                 return Unauthorized("Invalid refresh request");
+            }
 
+            // ===============================
+            // Failure Path #2: Token already revoked
+            // ===============================
+            // ✅ Safe log: UserId + Email + IP only
+            // 📌 Indicates possible reuse of an old token (suspicious).
             if (student.RefreshTokenRevokedAt != null)
+            {
+                _logger.LogWarning(
+                    "Refresh attempt using revoked token. UserId={UserId}, Email={Email}, IP={IP}",
+                    student.Id,
+                    student.Email,
+                    ip
+                );
+
                 return Unauthorized("Refresh token is revoked");
+            }
 
+            // ===============================
+            // Failure Path #3: Token expired
+            // ===============================
+            // ✅ Safe log: UserId + Email + IP only
+            // 📌 Expired refresh usage can be normal or automated retry — log helps visibility.
             if (student.RefreshTokenExpiresAt == null || student.RefreshTokenExpiresAt <= DateTime.UtcNow)
-                return Unauthorized("Refresh token expired");
+            {
+                _logger.LogWarning(
+                    "Refresh attempt using expired token. UserId={UserId}, Email={Email}, IP={IP}",
+                    student.Id,
+                    student.Email,
+                    ip
+                );
 
+                return Unauthorized("Refresh token expired");
+            }
+
+            // ===============================
+            // Failure Path #4: Invalid refresh token value
+            // ===============================
+            // ❌ Never log the raw refresh token
+            // ✅ Only log outcome + identity data
             bool refreshValid = BCrypt.Net.BCrypt.Verify(request.RefreshToken, student.RefreshTokenHash);
             if (!refreshValid)
-                return Unauthorized("Invalid refresh token");
+            {
+                _logger.LogWarning(
+                    "Invalid refresh token attempt. UserId={UserId}, Email={Email}, IP={IP}",
+                    student.Id,
+                    student.Email,
+                    ip
+                );
 
-            // Issue NEW access token (same claims & signing settings as login)
+                return Unauthorized("Invalid refresh token");
+            }
+
+            // ===============================
+            // Success: Issue NEW access token (same claims & signing settings as login)
+            // ===============================
             var claims = new[]
             {
         new Claim(ClaimTypes.NameIdentifier, student.Id.ToString()),
@@ -155,11 +251,22 @@ namespace StudentApi.Controllers
 
             var newAccessToken = new JwtSecurityTokenHandler().WriteToken(jwt);
 
-            // Rotation: replace refresh token
+            // ===============================
+            // Rotation: Replace refresh token
+            // ===============================
+            // ✅ Token rotation reduces damage if a refresh token is stolen.
             var newRefreshToken = GenerateRefreshToken();
             student.RefreshTokenHash = BCrypt.Net.BCrypt.HashPassword(newRefreshToken);
             student.RefreshTokenExpiresAt = DateTime.UtcNow.AddDays(7);
             student.RefreshTokenRevokedAt = null;
+
+            // ✅ Optional low-noise success log (safe)
+            _logger.LogInformation(
+                "Refresh succeeded. UserId={UserId}, Email={Email}, IP={IP}",
+                student.Id,
+                student.Email,
+                ip
+            );
 
             return Ok(new TokenResponse
             {
